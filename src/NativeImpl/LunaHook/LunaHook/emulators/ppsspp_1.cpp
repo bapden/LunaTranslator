@@ -240,7 +240,7 @@ namespace
                 dp = so + 0x20;
                 count = min((DWORD)0x1000, (0x0A000000 - dp) / 2);
             }
-            auto p = (WORD *)PPSSPP::emu_addr(context, dp);
+            auto p = (WORD *)(uintptr_t)PPSSPP::emu_addr(context, dp);
             for (DWORD i = 0; i < count && p[i]; i++)
                 u.push_back(p[i]);
             return u;
