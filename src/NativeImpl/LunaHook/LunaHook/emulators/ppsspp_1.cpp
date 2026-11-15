@@ -124,45 +124,89 @@ namespace
         if (buffer->size == 1)
             buffer->clear();
     }
-    void ULJS00339(hook_context *context, HookParam *hp, TextBuffer *buffer, uintptr_t *split)
+    // アマガミ: strings of the game's script VM. String object `so`:
+    // [so+4] = byte length, [so+8] = UShortArray `ca` with [ca+8] = char
+    // count and [ca+0xC] = pointer to the chars (Shift-JIS stored big-endian
+    // in 16-bit units). Short literals keep their chars inline at so+0x20,
+    // but strings built at run time (most lines of event scenes, e.g. boxes
+    // with several speakers) point to an external buffer, so reading so+0x20
+    // gave only the speaker names. Read through ca, like String:[] does.
+    namespace ULJS00339_vm
     {
-        auto a2 = PPSSPP::emu_arg(context)[0];
-
-        auto vm = *(DWORD *)(a2 + (0x28));
-        vm = *(DWORD *)PPSSPP::emu_addr(context, vm);
-        vm = *(DWORD *)PPSSPP::emu_addr(context, vm + 8);
-        uintptr_t address = PPSSPP::emu_addr(context, vm);
-        auto len1 = *(DWORD *)(address + 4);
-        auto p = address + 0x20;
-        if (len1 > 4 && *(WORD *)(p + 2) == 0)
+        static DWORD reg(hook_context *context, int idx)
         {
-            auto p1 = *(DWORD *)(address + 8);
-            vm = *(DWORD *)PPSSPP::emu_addr(context, vm);
-            vm = *(DWORD *)PPSSPP::emu_addr(context, vm + 0xC);
-            p = PPSSPP::emu_addr(context, vm);
+#ifndef _WIN64
+            auto args = context->ebp;
+#else
+            auto args = context->r14;
+#endif
+            return *(uint32_t *)(args - 0x80 + 0x10 + idx * 4);
+        }
+        static bool ok(DWORD a, DWORD n = 4)
+        {
+            return a >= 0x08000000 && a < 0x0A000000 && n <= 0x0A000000 - a;
+        }
+        static DWORD rd(hook_context *context, DWORD a)
+        {
+            return *(DWORD *)PPSSPP::emu_addr(context, a);
+        }
+        // receiver of a VM method call: a0 = VM context, [a0+0x28] = argument
+        // stack, stack[0] = receiver value, value+8 = String object
+        static DWORD receiver(hook_context *context)
+        {
+            DWORD a0 = reg(context, 0);
+            if (!ok(a0 + 0x28))
+                return 0;
+            DWORD sp = rd(context, a0 + 0x28);
+            if (!ok(sp))
+                return 0;
+            DWORD val = rd(context, sp);
+            if (!ok(val + 8))
+                return 0;
+            DWORD so = rd(context, val + 8);
+            if (!ok(so, 0x24) || rd(context, so) != 2)
+                return 0;
+            return so;
+        }
+        static std::vector<WORD> units(hook_context *context, DWORD so)
+        {
+            std::vector<WORD> u;
+            DWORD ca = rd(context, so + 8);
+            DWORD dp = 0, count = 0;
+            if (ok(ca, 0x10))
+            {
+                count = rd(context, ca + 8);
+                dp = rd(context, ca + 0xC);
+                if (count > 0x1000 || !ok(dp, count * 2))
+                    dp = 0;
+            }
+            if (!dp)
+            {
+                dp = so + 0x20;
+                count = min((DWORD)0x1000, (0x0A000000 - dp) / 2);
+            }
+            auto p = (WORD *)(uintptr_t)PPSSPP::emu_addr(context, dp);
+            for (DWORD i = 0; i < count && p[i]; i++)
+                u.push_back(p[i]);
+            return u;
         }
         static int fm = 0;
-        static std::string pre;
-        auto b = fm;
-        auto s = [](uintptr_t address)
+        static std::string convert(const std::vector<WORD> &u, bool countPlayer)
         {
-            auto frist = *(WORD *)address;
+            if (u.empty())
+                return std::string();
+            auto frist = u[0];
             auto lo = frist & 0xFF; // uppercase: 41->5A
             auto hi = frist >> 8;
             if (hi == 0 && (lo > 0x5a || lo < 0x41) /* T,W,? */)
-            {
                 return std::string();
-            }
             std::string s;
-            int i = 0;
-            WORD c;
             char buf[3] = {0};
-            while ((c = *(WORD *)(address + i)) != 0)
+            for (WORD c : u)
             {
                 // reverse endian: ShiftJIS BE => LE
                 buf[0] = c >> 8;
                 buf[1] = c & 0xFF;
-
                 if (c == 0x815e /* ／ */)
                 {
                     s += ' '; // single line
@@ -175,23 +219,54 @@ namespace
                     if (buf[1] == 0x4e)
                     {
                         s += "PLAYER";
-                        fm++;
+                        if (countPlayer)
+                            fm++;
                     }
                 }
                 else
                 {
                     s += buf;
                 }
-                i += 2;
             }
             return s;
-        }(p);
+        }
+    }
+    // String.length()
+    void ULJS00339(hook_context *context, HookParam *hp, TextBuffer *buffer, uintptr_t *split)
+    {
+        DWORD so = ULJS00339_vm::receiver(context);
+        if (!so)
+            return;
+        static std::string pre;
+        auto b = ULJS00339_vm::fm;
+        auto s = ULJS00339_vm::convert(ULJS00339_vm::units(context, so), true);
         if (b > 0)
         {
-            fm--;
+            ULJS00339_vm::fm--;
             return;
         }
         if (s == pre)
+            return;
+        pre = s;
+        buffer->from(s);
+    }
+    // String:[] (char access): some event lines never go through length(),
+    // but every displayed line is read char by char through this method.
+    void ULJS00339_1(hook_context *context, HookParam *hp, TextBuffer *buffer, uintptr_t *split)
+    {
+        static DWORD lastso = 0, lastcount = 0;
+        static std::string pre;
+        DWORD so = ULJS00339_vm::receiver(context);
+        if (!so)
+            return;
+        DWORD ca = ULJS00339_vm::rd(context, so + 8);
+        DWORD count = ULJS00339_vm::ok(ca, 0x10) ? ULJS00339_vm::rd(context, ca + 8) : 0;
+        if (so == lastso && count == lastcount)
+            return;
+        lastso = so;
+        lastcount = count;
+        auto s = ULJS00339_vm::convert(ULJS00339_vm::units(context, so), false);
+        if (s.empty() || s == pre)
             return;
         pre = s;
         buffer->from(s);
@@ -1788,6 +1863,7 @@ static const emfuncinfoX emfunctionhooks_1[] = {
     {0x883bf34, {0, 1, 0, 0, ULJS00403, "ULJS00403"}},
     // アマガミ
     {0x0886775c, {0, 0, 0, ULJS00339, 0, "ULJS00339"}}, // String.length()
+    {0x0886727c, {0, 0, 0, ULJS00339_1, 0, "ULJS00339"}}, // String:[]
     // 世界でいちばんNG（だめ）な恋
     {0x8814adc, {0, 0, 0, 0, NPJH50909_filter, "ULJM05878"}}, // name + dialouge
     {0x8850b2c, {0, 0, 0, 0, NPJH50909_filter, "ULJM05878"}}, // onscreen toast
