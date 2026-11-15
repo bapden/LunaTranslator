@@ -4,6 +4,7 @@
 #include <string>
 #include <share.h>
 #include <unordered_map>
+#include <vector>
 namespace
 {
     void NPJH50796(TextBuffer *buffer, HookParam *hp)
@@ -129,12 +130,18 @@ namespace
         if (buffer->size == 1)
             buffer->clear();
     }
-    // ---- Amagami diagnostic log (temporary) ----
-    // Writes every string seen by the ULJS00339 hook, before any filtering,
-    // to amagami_diag.log next to LunaHook64.dll. Text is hex-encoded
-    // (Shift-JIS stored big-endian in 16-bit units) and decoded offline.
-    namespace amagami_diag
+    // ---- Amagami (ULJS00339) ----
+    // Strings of the game's script VM: String object `so` has [so+4] = byte
+    // length, [so+8] = pointer to a UShortArray `ca` with [ca+8] = char count
+    // and [ca+0xC] = pointer to the chars (Shift-JIS stored big-endian in
+    // 16-bit units). Short literals keep their chars inline at so+0x20, but
+    // strings built at run time (most dialogue of event scenes) point to an
+    // external buffer, so the chars must be read through ca.
+    // Two VM methods are hooked: String.length() and String:[] (char access),
+    // because many event lines never go through length().
+    namespace amagami
     {
+        // Temporary diagnostic log: amagami_diag.log next to LunaHook64.dll.
         static std::mutex mtx;
         static FILE *f = nullptr;
         static bool tried = false;
@@ -160,167 +167,163 @@ namespace
             p = p.substr(0, pos + 1) + L"amagami_diag.log";
             f = _wfsopen(p.c_str(), L"ab", _SH_DENYNO);
         }
-        static void hexappend(std::string &out, const BYTE *data, size_t len)
-        {
-            static const char *hx = "0123456789ABCDEF";
-            for (size_t i = 0; i < len; i++)
-            {
-                out += hx[data[i] >> 4];
-                out += hx[data[i] & 15];
-            }
-        }
-        static void log(uintptr_t address, uintptr_t p, DWORD len1, int alt, int fm_before, const char *verdict, DWORD method = 0x0886775c, unsigned calls = 0)
+        static void log(DWORD method, const char *verdict, const std::string &sjis)
         {
             std::lock_guard<std::mutex> lk(mtx);
             open_once();
             if (!f || written > 30 * 1024 * 1024)
                 return;
-            std::string line = "#" + std::to_string(++seq) + " t=" + std::to_string(GetTickCount()) +
-                               " len1=" + std::to_string(len1) + " alt=" + std::to_string(alt) +
-                               " fm=" + std::to_string(fm_before) + " v=" + verdict + " m=" + std::to_string(method) + " n=" + std::to_string(calls) + " hdr=";
-            hexappend(line, (const BYTE *)address, 0x30);
-            line += " txt=";
-            size_t i = 0;
-            for (; i < 1024; i++)
+            static const char *hx = "0123456789ABCDEF";
+            std::string line = "#" + std::to_string(++seq) + " t=" + std::to_string(GetTickCount()) + " m=" + std::to_string(method) + " v=" + verdict + " sjis=";
+            for (unsigned char c : sjis)
             {
-                if (*(WORD *)(p + i * 2) == 0)
-                    break;
+                line += hx[c >> 4];
+                line += hx[c & 15];
             }
-            hexappend(line, (const BYTE *)p, i * 2);
             line += "\n";
             fwrite(line.data(), 1, line.size(), f);
             fflush(f);
             written += line.size();
         }
-    }
-    // Probe for the other String methods of the game's script VM: logs the
-    // receiver string (only when it changes for that method), outputs nothing.
-    static DWORD amg_reg(hook_context *context, int idx)
-    {
-#ifndef _WIN64
-        auto args = context->ebp;
-#else
-        auto args = context->r14;
-#endif
-        return *(uint32_t *)(args - 0x80 + 0x10 + idx * 4);
-    }
-    static bool amg_ok(DWORD a, DWORD n = 4)
-    {
-        return a >= 0x08000000 && a < 0x0A000000 && a + n <= 0x0A000000;
-    }
-    void ULJS00339_probe(hook_context *context, HookParam *hp, TextBuffer *buffer, uintptr_t *split)
-    {
-        static std::unordered_map<DWORD, std::string> last;
-        static std::unordered_map<DWORD, unsigned> calls;
-        DWORD m = hp->emu_addr;
-        unsigned n = ++calls[m];
-        DWORD a0 = amg_reg(context, 0);
-        if (!amg_ok(a0 + 0x28))
-            return;
-        DWORD sp = *(DWORD *)PPSSPP::emu_addr(context, a0 + 0x28);
-        if (!amg_ok(sp))
-            return;
-        DWORD val = *(DWORD *)PPSSPP::emu_addr(context, sp);
-        if (!amg_ok(val + 8))
-            return;
-        DWORD so = *(DWORD *)PPSSPP::emu_addr(context, val + 8);
-        if (!amg_ok(so, 0x30))
-            return;
-        uintptr_t address = PPSSPP::emu_addr(context, so);
-        DWORD type = *(DWORD *)address;
-        DWORD len1 = *(DWORD *)(address + 4);
-        if (type != 2 || len1 == 0 || len1 > 0x2000 || !amg_ok(so + 0x20, len1 + 2))
-            return;
-        uintptr_t p = address + 0x20;
-        std::string key((const char *)p, (size_t)min(len1, (DWORD)0x2000));
-        auto &l = last[m];
-        if (l == key)
-            return;
-        l = key;
-        amagami_diag::log(address, p, len1, 0, 0, "probe", m, n);
-    }
-    void ULJS00339(hook_context *context, HookParam *hp, TextBuffer *buffer, uintptr_t *split)
-    {
-        auto a2 = PPSSPP::emu_arg(context)[0];
 
-        auto vm = *(DWORD *)(a2 + (0x28));
-        vm = *(DWORD *)PPSSPP::emu_addr(context, vm);
-        vm = *(DWORD *)PPSSPP::emu_addr(context, vm + 8);
-        uintptr_t address = PPSSPP::emu_addr(context, vm);
-        auto len1 = *(DWORD *)(address + 4);
-        auto p = address + 0x20;
-        int alt = 0;
-        if (len1 > 4 && *(WORD *)(p + 2) == 0)
+        static DWORD reg(hook_context *context, int idx)
         {
-            alt = 1;
-            auto p1 = *(DWORD *)(address + 8);
-            vm = *(DWORD *)PPSSPP::emu_addr(context, vm);
-            vm = *(DWORD *)PPSSPP::emu_addr(context, vm + 0xC);
-            p = PPSSPP::emu_addr(context, vm);
+#ifndef _WIN64
+            auto args = context->ebp;
+#else
+            auto args = context->r14;
+#endif
+            return *(uint32_t *)(args - 0x80 + 0x10 + idx * 4);
+        }
+        static bool ok(DWORD a, DWORD n = 4)
+        {
+            return a >= 0x08000000 && a < 0x0A000000 && n <= 0x0A000000 - a;
+        }
+        static DWORD rd(hook_context *context, DWORD a)
+        {
+            return *(DWORD *)PPSSPP::emu_addr(context, a);
+        }
+        // Receiver String object of a VM method call: a0 = VM context,
+        // [a0+0x28] = argument stack, stack[0] = receiver, receiver+8 = String.
+        static DWORD receiver(hook_context *context)
+        {
+            DWORD a0 = reg(context, 0);
+            if (!ok(a0 + 0x28))
+                return 0;
+            DWORD sp = rd(context, a0 + 0x28);
+            if (!ok(sp))
+                return 0;
+            DWORD val = rd(context, sp);
+            if (!ok(val + 8))
+                return 0;
+            DWORD so = rd(context, val + 8);
+            if (!ok(so, 0x24) || rd(context, so) != 2)
+                return 0;
+            return so;
+        }
+        // Raw 16-bit units of the string (stops at count or at a 0 unit).
+        static std::vector<WORD> units(hook_context *context, DWORD so)
+        {
+            std::vector<WORD> u;
+            DWORD ca = rd(context, so + 8);
+            DWORD dp = 0, count = 0;
+            if (ok(ca, 0x10))
+            {
+                count = rd(context, ca + 8);
+                dp = rd(context, ca + 0xC);
+                if (count > 0x1000 || !ok(dp, count * 2))
+                    dp = 0;
+            }
+            if (!dp)
+            {
+                // fallback: inline chars, 0-terminated
+                dp = so + 0x20;
+                count = min((DWORD)0x1000, (0x0A000000 - dp) / 2);
+            }
+            auto p = (WORD *)PPSSPP::emu_addr(context, dp);
+            for (DWORD i = 0; i < count && p[i]; i++)
+                u.push_back(p[i]);
+            return u;
         }
         static int fm = 0;
         static std::string pre;
-        auto b = fm;
-        auto s = [](uintptr_t address)
+        // Same conversion as before: Shift-JIS big-endian units -> Shift-JIS,
+        // '／' -> space, ASCII control codes dropped, {N} -> PLAYER.
+        static std::string convert(const std::vector<WORD> &u, bool countPlayer)
         {
-            auto frist = *(WORD *)address;
-            auto lo = frist & 0xFF; // uppercase: 41->5A
-            auto hi = frist >> 8;
-            if (hi == 0 && (lo > 0x5a || lo < 0x41) /* T,W,? */)
-            {
+            if (u.empty())
                 return std::string();
-            }
+            auto first = u[0];
+            auto lo = first & 0xFF; // uppercase: 41->5A
+            auto hi = first >> 8;
+            if (hi == 0 && (lo > 0x5a || lo < 0x41) /* T,W,? */)
+                return std::string();
             std::string s;
-            int i = 0;
-            WORD c;
             char buf[3] = {0};
-            while ((c = *(WORD *)(address + i)) != 0)
+            for (WORD c : u)
             {
-                // reverse endian: ShiftJIS BE => LE
                 buf[0] = c >> 8;
                 buf[1] = c & 0xFF;
-
                 if (c == 0x815e /* ／ */)
-                {
                     s += ' '; // single line
-                }
                 else if (buf[0] == 0)
                 {
                     //// UTF16 LE turned BE: 5700=>0057, 3100, 3500
                     //// 4e00 6d00=>PLAYER
-                    // do nothing
                     if (buf[1] == 0x4e)
                     {
                         s += "PLAYER";
-                        fm++;
+                        if (countPlayer)
+                            fm++;
                     }
                 }
                 else
-                {
                     s += buf;
-                }
-                i += 2;
             }
             return s;
-        }(p);
-        {
-            const char *verdict = "out";
-            if (b > 0)
-                verdict = "skip_fm";
-            else if (s.empty())
-                verdict = "empty";
-            else if (s == pre)
-                verdict = "dup";
-            amagami_diag::log(address, p, len1, alt, b, verdict);
         }
+    }
+    // String.length()
+    void ULJS00339(hook_context *context, HookParam *hp, TextBuffer *buffer, uintptr_t *split)
+    {
+        DWORD so = amagami::receiver(context);
+        if (!so)
+            return;
+        auto b = amagami::fm;
+        auto s = amagami::convert(amagami::units(context, so), true);
         if (b > 0)
         {
-            fm--;
+            amagami::fm--;
             return;
         }
-        if (s == pre)
+        if (s == amagami::pre)
             return;
-        pre = s;
+        amagami::pre = s;
+        if (!s.empty())
+            amagami::log(hp->emu_addr, "out", s);
+        buffer->from(s);
+    }
+    // String:[] (char access): called once per character while a string is
+    // processed (this is how event-scene lines reach the text box), so only
+    // look at a string again when the receiver object changes.
+    void ULJS00339_index(hook_context *context, HookParam *hp, TextBuffer *buffer, uintptr_t *split)
+    {
+        static DWORD lastso = 0, lastcount = 0;
+        static std::string prei;
+        DWORD so = amagami::receiver(context);
+        if (!so)
+            return;
+        DWORD ca = amagami::rd(context, so + 8);
+        DWORD count = amagami::ok(ca, 0x10) ? amagami::rd(context, ca + 8) : 0;
+        if (so == lastso && count == lastcount)
+            return;
+        lastso = so;
+        lastcount = count;
+        auto s = amagami::convert(amagami::units(context, so), false);
+        if (s.empty() || s == prei)
+            return;
+        prei = s;
+        amagami::log(hp->emu_addr, "out", s);
         buffer->from(s);
     }
 
@@ -1915,20 +1918,7 @@ static const emfuncinfoX emfunctionhooks_1[] = {
     {0x883bf34, {0, 1, 0, 0, ULJS00403, "ULJS00403"}},
     // アマガミ
     {0x0886775c, {0, 0, 0, ULJS00339, 0, "ULJS00339"}}, // String.length()
-    {0x08867174, {0, 0, 0, ULJS00339_probe, 0, "ULJS00339"}}, // String method probe (diagnostic)
-    {0x08866e84, {0, 0, 0, ULJS00339_probe, 0, "ULJS00339"}}, // String method probe (diagnostic)
-    {0x088671d8, {0, 0, 0, ULJS00339_probe, 0, "ULJS00339"}}, // String method probe (diagnostic)
-    {0x088671e4, {0, 0, 0, ULJS00339_probe, 0, "ULJS00339"}}, // String method probe (diagnostic)
-    {0x08867238, {0, 0, 0, ULJS00339_probe, 0, "ULJS00339"}}, // String method probe (diagnostic)
-    {0x08867254, {0, 0, 0, ULJS00339_probe, 0, "ULJS00339"}}, // String method probe (diagnostic)
-    {0x08867778, {0, 0, 0, ULJS00339_probe, 0, "ULJS00339"}}, // String method probe (diagnostic)
-    {0x0886727c, {0, 0, 0, ULJS00339_probe, 0, "ULJS00339"}}, // String method probe (diagnostic)
-    {0x08867348, {0, 0, 0, ULJS00339_probe, 0, "ULJS00339"}}, // String method probe (diagnostic)
-    {0x0886745c, {0, 0, 0, ULJS00339_probe, 0, "ULJS00339"}}, // String method probe (diagnostic)
-    {0x08867668, {0, 0, 0, ULJS00339_probe, 0, "ULJS00339"}}, // String method probe (diagnostic)
-    {0x08867750, {0, 0, 0, ULJS00339_probe, 0, "ULJS00339"}}, // String method probe (diagnostic)
-    {0x08866d58, {0, 0, 0, ULJS00339_probe, 0, "ULJS00339"}}, // String method probe (diagnostic)
-    {0x0886785c, {0, 0, 0, ULJS00339_probe, 0, "ULJS00339"}}, // String method probe (diagnostic)
+    {0x0886727c, {0, 0, 0, ULJS00339_index, 0, "ULJS00339"}}, // String:[]
     // 世界でいちばんNG（だめ）な恋
     {0x8814adc, {0, 0, 0, 0, NPJH50909_filter, "ULJM05878"}}, // name + dialouge
     {0x8850b2c, {0, 0, 0, 0, NPJH50909_filter, "ULJM05878"}}, // onscreen toast
