@@ -2,6 +2,8 @@
 #include <mutex>
 #include <cstdio>
 #include <string>
+#include <share.h>
+#include <unordered_map>
 namespace
 {
     void NPJH50796(TextBuffer *buffer, HookParam *hp)
@@ -156,8 +158,7 @@ namespace
             if (pos == std::wstring::npos)
                 return;
             p = p.substr(0, pos + 1) + L"amagami_diag.log";
-            if (_wfopen_s(&f, p.c_str(), L"ab") != 0)
-                f = nullptr;
+            f = _wfsopen(p.c_str(), L"ab", _SH_DENYNO);
         }
         static void hexappend(std::string &out, const BYTE *data, size_t len)
         {
@@ -168,7 +169,7 @@ namespace
                 out += hx[data[i] & 15];
             }
         }
-        static void log(uintptr_t address, uintptr_t p, DWORD len1, int alt, int fm_before, const char *verdict)
+        static void log(uintptr_t address, uintptr_t p, DWORD len1, int alt, int fm_before, const char *verdict, DWORD method = 0x0886775c, unsigned calls = 0)
         {
             std::lock_guard<std::mutex> lk(mtx);
             open_once();
@@ -176,7 +177,7 @@ namespace
                 return;
             std::string line = "#" + std::to_string(++seq) + " t=" + std::to_string(GetTickCount()) +
                                " len1=" + std::to_string(len1) + " alt=" + std::to_string(alt) +
-                               " fm=" + std::to_string(fm_before) + " v=" + verdict + " hdr=";
+                               " fm=" + std::to_string(fm_before) + " v=" + verdict + " m=" + std::to_string(method) + " n=" + std::to_string(calls) + " hdr=";
             hexappend(line, (const BYTE *)address, 0x30);
             line += " txt=";
             size_t i = 0;
@@ -191,6 +192,52 @@ namespace
             fflush(f);
             written += line.size();
         }
+    }
+    // Probe for the other String methods of the game's script VM: logs the
+    // receiver string (only when it changes for that method), outputs nothing.
+    static DWORD amg_reg(hook_context *context, int idx)
+    {
+#ifndef _WIN64
+        auto args = context->ebp;
+#else
+        auto args = context->r14;
+#endif
+        return *(uint32_t *)(args - 0x80 + 0x10 + idx * 4);
+    }
+    static bool amg_ok(DWORD a, DWORD n = 4)
+    {
+        return a >= 0x08000000 && a < 0x0A000000 && a + n <= 0x0A000000;
+    }
+    void ULJS00339_probe(hook_context *context, HookParam *hp, TextBuffer *buffer, uintptr_t *split)
+    {
+        static std::unordered_map<DWORD, std::string> last;
+        static std::unordered_map<DWORD, unsigned> calls;
+        DWORD m = hp->emu_addr;
+        unsigned n = ++calls[m];
+        DWORD a0 = amg_reg(context, 0);
+        if (!amg_ok(a0 + 0x28))
+            return;
+        DWORD sp = *(DWORD *)PPSSPP::emu_addr(context, a0 + 0x28);
+        if (!amg_ok(sp))
+            return;
+        DWORD val = *(DWORD *)PPSSPP::emu_addr(context, sp);
+        if (!amg_ok(val + 8))
+            return;
+        DWORD so = *(DWORD *)PPSSPP::emu_addr(context, val + 8);
+        if (!amg_ok(so, 0x30))
+            return;
+        uintptr_t address = PPSSPP::emu_addr(context, so);
+        DWORD type = *(DWORD *)address;
+        DWORD len1 = *(DWORD *)(address + 4);
+        if (type != 2 || len1 == 0 || len1 > 0x2000 || !amg_ok(so + 0x20, len1 + 2))
+            return;
+        uintptr_t p = address + 0x20;
+        std::string key((const char *)p, (size_t)min(len1, (DWORD)0x2000));
+        auto &l = last[m];
+        if (l == key)
+            return;
+        l = key;
+        amagami_diag::log(address, p, len1, 0, 0, "probe", m, n);
     }
     void ULJS00339(hook_context *context, HookParam *hp, TextBuffer *buffer, uintptr_t *split)
     {
@@ -1868,6 +1915,20 @@ static const emfuncinfoX emfunctionhooks_1[] = {
     {0x883bf34, {0, 1, 0, 0, ULJS00403, "ULJS00403"}},
     // アマガミ
     {0x0886775c, {0, 0, 0, ULJS00339, 0, "ULJS00339"}}, // String.length()
+    {0x08867174, {0, 0, 0, ULJS00339_probe, 0, "ULJS00339"}}, // String method probe (diagnostic)
+    {0x08866e84, {0, 0, 0, ULJS00339_probe, 0, "ULJS00339"}}, // String method probe (diagnostic)
+    {0x088671d8, {0, 0, 0, ULJS00339_probe, 0, "ULJS00339"}}, // String method probe (diagnostic)
+    {0x088671e4, {0, 0, 0, ULJS00339_probe, 0, "ULJS00339"}}, // String method probe (diagnostic)
+    {0x08867238, {0, 0, 0, ULJS00339_probe, 0, "ULJS00339"}}, // String method probe (diagnostic)
+    {0x08867254, {0, 0, 0, ULJS00339_probe, 0, "ULJS00339"}}, // String method probe (diagnostic)
+    {0x08867778, {0, 0, 0, ULJS00339_probe, 0, "ULJS00339"}}, // String method probe (diagnostic)
+    {0x0886727c, {0, 0, 0, ULJS00339_probe, 0, "ULJS00339"}}, // String method probe (diagnostic)
+    {0x08867348, {0, 0, 0, ULJS00339_probe, 0, "ULJS00339"}}, // String method probe (diagnostic)
+    {0x0886745c, {0, 0, 0, ULJS00339_probe, 0, "ULJS00339"}}, // String method probe (diagnostic)
+    {0x08867668, {0, 0, 0, ULJS00339_probe, 0, "ULJS00339"}}, // String method probe (diagnostic)
+    {0x08867750, {0, 0, 0, ULJS00339_probe, 0, "ULJS00339"}}, // String method probe (diagnostic)
+    {0x08866d58, {0, 0, 0, ULJS00339_probe, 0, "ULJS00339"}}, // String method probe (diagnostic)
+    {0x0886785c, {0, 0, 0, ULJS00339_probe, 0, "ULJS00339"}}, // String method probe (diagnostic)
     // 世界でいちばんNG（だめ）な恋
     {0x8814adc, {0, 0, 0, 0, NPJH50909_filter, "ULJM05878"}}, // name + dialouge
     {0x8850b2c, {0, 0, 0, 0, NPJH50909_filter, "ULJM05878"}}, // onscreen toast
