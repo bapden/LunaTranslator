@@ -1,0 +1,56 @@
+name: amagami-diag
+
+on:
+  push:
+    branches: [amagami-diag]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (LunaHook x64, win10)
+        shell: pwsh
+        working-directory: src/NativeImpl/LunaHook
+        run: |
+          cmake -DWIN10ABOVE=ON -DBUILD_HOST=OFF ./CMakeLists.txt -G "Visual Studio 18 2026" -A x64 -T host=x64 -B ./build/x64_win10_2
+          if ($LASTEXITCODE -ne 0) {
+            Remove-Item -Recurse -Force ./build/x64_win10_2 -ErrorAction SilentlyContinue
+            cmake -DWIN10ABOVE=ON -DBUILD_HOST=OFF ./CMakeLists.txt -G "Visual Studio 17 2022" -A x64 -T host=x64 -B ./build/x64_win10_2
+          }
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Build
+        shell: pwsh
+        working-directory: src/NativeImpl/LunaHook
+        run: cmake --build ./build/x64_win10_2 --config Release --target ALL_BUILD
+
+      - name: Collect DLL
+        shell: pwsh
+        run: |
+          Get-ChildItem -Recurse src/NativeImpl/LunaHook/builds | Select-Object FullName, Length | Format-Table -AutoSize
+          $dll = Get-ChildItem -Recurse src/NativeImpl/LunaHook/builds -Filter LunaHook64.dll | Select-Object -First 1
+          if (-not $dll) { throw "LunaHook64.dll not found" }
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item $dll.FullName out/LunaHook64.dll
+          (Get-FileHash out/LunaHook64.dll -Algorithm SHA256).Hash | Out-File out/LunaHook64.dll.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LunaHook64-amagami-diag
+          path: out/
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: amagami-diag-${{ github.run_number }}
+          name: Amagami diag ${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          prerelease: true
+          files: |
+            out/LunaHook64.dll
+            out/LunaHook64.dll.sha256
