@@ -1,4 +1,7 @@
 #include "ppsspp_1.h"
+#include <mutex>
+#include <cstdio>
+#include <string>
 namespace
 {
     void NPJH50796(TextBuffer *buffer, HookParam *hp)
@@ -124,6 +127,71 @@ namespace
         if (buffer->size == 1)
             buffer->clear();
     }
+    // ---- Amagami diagnostic log (temporary) ----
+    // Writes every string seen by the ULJS00339 hook, before any filtering,
+    // to amagami_diag.log next to LunaHook64.dll. Text is hex-encoded
+    // (Shift-JIS stored big-endian in 16-bit units) and decoded offline.
+    namespace amagami_diag
+    {
+        static std::mutex mtx;
+        static FILE *f = nullptr;
+        static bool tried = false;
+        static size_t written = 0;
+        static unsigned seq = 0;
+        static void open_once()
+        {
+            if (f || tried)
+                return;
+            tried = true;
+            HMODULE hm = nullptr;
+            if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                    (LPCWSTR)&open_once, &hm))
+                return;
+            wchar_t path[1024] = {0};
+            DWORD n = GetModuleFileNameW(hm, path, 1024);
+            if (!n || n >= 1024)
+                return;
+            std::wstring p(path, n);
+            auto pos = p.find_last_of(L"\\/");
+            if (pos == std::wstring::npos)
+                return;
+            p = p.substr(0, pos + 1) + L"amagami_diag.log";
+            if (_wfopen_s(&f, p.c_str(), L"ab") != 0)
+                f = nullptr;
+        }
+        static void hexappend(std::string &out, const BYTE *data, size_t len)
+        {
+            static const char *hx = "0123456789ABCDEF";
+            for (size_t i = 0; i < len; i++)
+            {
+                out += hx[data[i] >> 4];
+                out += hx[data[i] & 15];
+            }
+        }
+        static void log(uintptr_t address, uintptr_t p, DWORD len1, int alt, int fm_before, const char *verdict)
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            open_once();
+            if (!f || written > 30 * 1024 * 1024)
+                return;
+            std::string line = "#" + std::to_string(++seq) + " t=" + std::to_string(GetTickCount()) +
+                               " len1=" + std::to_string(len1) + " alt=" + std::to_string(alt) +
+                               " fm=" + std::to_string(fm_before) + " v=" + verdict + " hdr=";
+            hexappend(line, (const BYTE *)address, 0x30);
+            line += " txt=";
+            size_t i = 0;
+            for (; i < 1024; i++)
+            {
+                if (*(WORD *)(p + i * 2) == 0)
+                    break;
+            }
+            hexappend(line, (const BYTE *)p, i * 2);
+            line += "\n";
+            fwrite(line.data(), 1, line.size(), f);
+            fflush(f);
+            written += line.size();
+        }
+    }
     void ULJS00339(hook_context *context, HookParam *hp, TextBuffer *buffer, uintptr_t *split)
     {
         auto a2 = PPSSPP::emu_arg(context)[0];
@@ -134,8 +202,10 @@ namespace
         uintptr_t address = PPSSPP::emu_addr(context, vm);
         auto len1 = *(DWORD *)(address + 4);
         auto p = address + 0x20;
+        int alt = 0;
         if (len1 > 4 && *(WORD *)(p + 2) == 0)
         {
+            alt = 1;
             auto p1 = *(DWORD *)(address + 8);
             vm = *(DWORD *)PPSSPP::emu_addr(context, vm);
             vm = *(DWORD *)PPSSPP::emu_addr(context, vm + 0xC);
@@ -186,6 +256,16 @@ namespace
             }
             return s;
         }(p);
+        {
+            const char *verdict = "out";
+            if (b > 0)
+                verdict = "skip_fm";
+            else if (s.empty())
+                verdict = "empty";
+            else if (s == pre)
+                verdict = "dup";
+            amagami_diag::log(address, p, len1, alt, b, verdict);
+        }
         if (b > 0)
         {
             fm--;
